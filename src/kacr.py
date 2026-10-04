@@ -2897,6 +2897,117 @@ def bootstrap_weighted_outcome(
         return summary, replicates
     return summary
 
+def sandwich_weighted_outcome(
+    ps_result: PSWeightResult,
+    *,
+    outcome_col: str,
+    alpha: float = 0.05,
+) -> pd.DataFrame:
+    """PS-weighted outcome effects with an M-estimation sandwich variance.
+
+    This mirrors the default inference of the PSweight R package: the
+    propensity-score (logistic) score equations and the two Hajek weighted
+    means are stacked as one M-estimator, so the variance accounts for
+    propensity-score estimation without refitting.
+
+    Estimating equations for patient i (e = PS, X = PS design matrix):
+        X_i (Z_i - e_i)                                  (logistic PS)
+        Z_i w1(e_i) (Y_i - mu1)                          (treated mean)
+        (1 - Z_i) w0(e_i) (Y_i - mu0)                    (control mean)
+    with w1 = 1 - e, w0 = e for ATO (overlap weights) and w1 = 1/e,
+    w0 = 1/(1 - e) for ATE (IPTW; stabilizing constants cancel in the
+    Hajek means). Var(theta) = A^-1 B A^-T / n.
+
+    The RD CI uses mu1 - mu0; the RR CI is built on the log scale.
+    Requires the unpenalized statsmodels GLM fitted by estimate_ps_weights.
+    """
+    est = ps_result.estimand.upper()
+    if est == "OW":
+        est = "ATO"
+    if est not in ("ATO", "ATE", "IPW"):
+        raise ValueError("sandwich_weighted_outcome supports ATO (OW) and ATE (IPTW) only.")
+
+    fit = ps_result.model
+    d = ps_result.df.loc[ps_result.df[ps_result.complete_col]].copy()
+    X = np.asarray(fit.model.exog, dtype=float)
+    if len(d) != X.shape[0]:
+        raise ValueError("PS design matrix and complete-case rows do not match.")
+
+    y = pd.to_numeric(d[outcome_col], errors="coerce").to_numpy(float)
+    if np.isnan(y).any():
+        raise ValueError(f"{outcome_col!r} has missing values in the PS sample.")
+    z = (d[ps_result.treatment_col] == ps_result.treated_label).to_numpy(float)
+    e = np.asarray(fit.predict(fit.model.exog), dtype=float)
+    n, p = X.shape
+
+    if est == "ATO":
+        w1, w0 = 1 - e, e
+        dw1, dw0 = -e * (1 - e), e * (1 - e)          # d w / d (x'beta)
+    else:
+        w1, w0 = 1 / e, 1 / (1 - e)
+        dw1, dw0 = -(1 - e) / e, e / (1 - e)
+
+    mu1 = np.sum(z * w1 * y) / np.sum(z * w1)
+    mu0 = np.sum((1 - z) * w0 * y) / np.sum((1 - z) * w0)
+
+    # Per-patient estimating functions, n x (p + 2)
+    psi = np.column_stack([
+        X * (z - e)[:, None],
+        z * w1 * (y - mu1),
+        (1 - z) * w0 * (y - mu0),
+    ])
+    B = psi.T @ psi / n
+
+    # A = -E[d psi / d theta]
+    A = np.zeros((p + 2, p + 2))
+    A[:p, :p] = (X * (e * (1 - e))[:, None]).T @ X / n
+    A[p, :p] = -np.sum(X * (z * (y - mu1) * dw1)[:, None], axis=0) / n
+    A[p, p] = np.sum(z * w1) / n
+    A[p + 1, :p] = -np.sum(X * ((1 - z) * (y - mu0) * dw0)[:, None], axis=0) / n
+    A[p + 1, p + 1] = np.sum((1 - z) * w0) / n
+
+    A_inv = np.linalg.inv(A)
+    V = A_inv @ B @ A_inv.T / n
+    v11, v00, v10 = V[p, p], V[p + 1, p + 1], V[p, p + 1]
+
+    zq = norm.ppf(1 - alpha / 2)
+    rd = mu1 - mu0
+    rd_se = float(np.sqrt(v11 + v00 - 2 * v10))
+    rd_p = float(2 * norm.sf(abs(rd / rd_se))) if rd_se > 0 else np.nan
+
+    if mu1 > 0 and mu0 > 0:
+        log_rr = np.log(mu1 / mu0)
+        lrr_se = float(np.sqrt(v11 / mu1**2 + v00 / mu0**2 - 2 * v10 / (mu1 * mu0)))
+        rr, rr_lo, rr_hi = np.exp(log_rr), np.exp(log_rr - zq * lrr_se), np.exp(log_rr + zq * lrr_se)
+        rr_p = float(2 * norm.sf(abs(log_rr / lrr_se))) if lrr_se > 0 else np.nan
+    else:
+        rr = rr_lo = rr_hi = lrr_se = rr_p = np.nan
+
+    ess = lambda w: float(w.sum() ** 2 / np.sum(w ** 2)) if np.sum(w ** 2) > 0 else np.nan
+    tl, cl = ps_result.treated_label, ps_result.control_label
+    return pd.DataFrame([{
+        "Estimand": est,
+        "CI method": "M-estimation sandwich (PS uncertainty included)",
+        "N": n,
+        f"{tl} weighted risk": mu1,
+        f"{tl} risk SE": float(np.sqrt(v11)),
+        f"{cl} weighted risk": mu0,
+        f"{cl} risk SE": float(np.sqrt(v00)),
+        "Risk difference": rd,
+        "RD SE": rd_se,
+        "RD CI low": rd - zq * rd_se,
+        "RD CI high": rd + zq * rd_se,
+        "RD p": rd_p,
+        "Risk ratio": rr,
+        "log(RR) SE": lrr_se,
+        "RR CI low": rr_lo,
+        "RR CI high": rr_hi,
+        "RR p": rr_p,
+        f"{tl} ESS": ess((z * w1)[z == 1]),
+        f"{cl} ESS": ess(((1 - z) * w0)[z == 0]),
+        "PS max SE": float(np.max(fit.bse)),
+    }])
+
 def love_plot(
     before_table: pd.DataFrame,
     after_table: pd.DataFrame,
